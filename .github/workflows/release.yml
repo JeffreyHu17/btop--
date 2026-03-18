@@ -17,7 +17,7 @@ jobs:
       release_sha: ${{ steps.version.outputs.release_sha }}
       prerelease: ${{ steps.version.outputs.prerelease }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           fetch-depth: 0
           submodules: recursive
@@ -93,7 +93,7 @@ jobs:
           - platform: linux/arm64
             arch_name: arm64
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           ref: ${{ needs.prepare.outputs.release_sha }}
           submodules: recursive
@@ -116,7 +116,7 @@ jobs:
             control-plane
           gzip -f "$TAR_PATH"
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v6
         with:
           name: docker-${{ matrix.arch_name }}
           path: ${{ runner.temp }}/release-assets/*
@@ -132,15 +132,21 @@ jobs:
           - runner: ubuntu-latest
             os_name: linux
             arch_name: x86_64
-          - runner: macos-13
+            c_compiler: gcc-14
+            cxx_compiler: g++-14
+          - runner: macos-15-intel
             os_name: macos
             arch_name: x86_64
-          - runner: macos-14
+            c_compiler: clang
+            cxx_compiler: clang++
+          - runner: macos-15
             os_name: macos
             arch_name: arm64
+            c_compiler: clang
+            cxx_compiler: clang++
     runs-on: ${{ matrix.runner }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           ref: ${{ needs.prepare.outputs.release_sha }}
           submodules: recursive
@@ -149,7 +155,7 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y libcurl4-openssl-dev nlohmann-json3-dev
+          sudo apt-get install -y gcc-14 g++-14 libcurl4-openssl-dev nlohmann-json3-dev
 
       - name: Install macOS dependencies
         if: runner.os == 'macOS'
@@ -161,7 +167,12 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          cmake -S . -B build-release -DBUILD_TESTING=OFF -DCMAKE_BUILD_TYPE=Release -DBTOP_GPU=OFF
+          cmake -S . -B build-release \
+            -DBUILD_TESTING=OFF \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DBTOP_GPU=OFF \
+            -DCMAKE_C_COMPILER=${{ matrix.c_compiler }} \
+            -DCMAKE_CXX_COMPILER=${{ matrix.cxx_compiler }}
 
       - name: Build agent
         shell: bash
@@ -184,7 +195,7 @@ jobs:
             "$ARTIFACT_DIR/btop-agent_${VERSION}_${{ matrix.os_name }}_${{ matrix.arch_name }}.tar.gz" \
             btop-agent
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v6
         with:
           name: agent-${{ matrix.os_name }}-${{ matrix.arch_name }}
           path: ${{ runner.temp }}/release-assets/*
@@ -198,12 +209,12 @@ jobs:
     if: needs.prepare.outputs.should_release == 'true'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           ref: ${{ needs.prepare.outputs.release_sha }}
           submodules: recursive
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v5
         with:
           path: downloaded-artifacts
 
