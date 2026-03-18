@@ -55,3 +55,17 @@ cmake --build build-host --target btop-agent -j4
 - Control plane: see [control-plane/README.md](/Volumes/Code/btop/control-plane/README.md)
 - btop core tree: see [btop/README.md](/Volumes/Code/btop/btop/README.md)
 - adaptation notes: see [agent/README.md](/Volumes/Code/btop/agent/README.md)
+
+## Release automation
+
+Push a commit to `main` whose subject is exactly a version string such as `V1.0.0`.
+The release workflow will rebuild the control-plane Docker tarballs and the supported
+`btop-agent` binaries, then create or update a GitHub Release with those assets.
+
+See [RELEASE_AUTOMATION.md](/Volumes/Code/btop/docs/RELEASE_AUTOMATION.md).
+
+## Installers
+
+Interactive installer:
+
+- [install.sh](/Volumes/Code/btop/install.sh)

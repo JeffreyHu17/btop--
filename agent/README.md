@@ -48,3 +48,14 @@ cmake -S /Volumes/Code/btop -B /tmp/btop-agent-check \
   -DBUILD_TESTING=OFF
 cmake --build /tmp/btop-agent-check --target btop-agent -j4
 ```
+
+## Packaging
+
+Agent release archives include:
+
+- `btop-agent`
+- `distributed-client.example.json`
+- `install.sh`
+
+Use the interactive installer from the repository root to install, update, configure,
+or uninstall the agent on supported Unix-like platforms.

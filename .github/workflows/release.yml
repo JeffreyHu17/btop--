@@ -1,0 +1,238 @@
+name: Release
+
+on:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: write
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      should_release: ${{ steps.version.outputs.should_release }}
+      version: ${{ steps.version.outputs.version }}
+      release_sha: ${{ steps.version.outputs.release_sha }}
+      prerelease: ${{ steps.version.outputs.prerelease }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          submodules: recursive
+
+      - id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          VERSION=""
+          RELEASE_SHA=""
+          MATCH_COUNT=0
+          VERSION_PATTERN='^(V[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?)$'
+
+          RANGE="${{ github.event.before }}..${{ github.sha }}"
+          if [[ "${{ github.event.before }}" == "0000000000000000000000000000000000000000" ]]; then
+            RANGE="${{ github.sha }}"
+          fi
+
+          while IFS=$'\t' read -r commit_sha subject; do
+            if [[ "$subject" =~ $VERSION_PATTERN ]]; then
+              VERSION="${BASH_REMATCH[1]}"
+              RELEASE_SHA="$commit_sha"
+              MATCH_COUNT=$((MATCH_COUNT + 1))
+            fi
+          done < <(git log --format='%H%x09%s' "$RANGE")
+
+          if [[ "$MATCH_COUNT" -eq 0 ]]; then
+            echo "should_release=false" >> "$GITHUB_OUTPUT"
+            echo "version=" >> "$GITHUB_OUTPUT"
+            echo "release_sha=" >> "$GITHUB_OUTPUT"
+            echo "prerelease=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if [[ "$MATCH_COUNT" -gt 1 ]]; then
+            echo "Multiple version commits found in this push; split releases into separate pushes." >&2
+            exit 1
+          fi
+
+          if [[ ! "$VERSION" =~ $VERSION_PATTERN ]]; then
+            echo "Invalid version format: $VERSION" >&2
+            exit 1
+          fi
+
+          PRERELEASE=false
+          if [[ "$VERSION" == *-* ]]; then
+            PRERELEASE=true
+          fi
+
+          echo "should_release=true" >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "release_sha=$RELEASE_SHA" >> "$GITHUB_OUTPUT"
+          echo "prerelease=$PRERELEASE" >> "$GITHUB_OUTPUT"
+
+      - name: Print release decision
+        run: |
+          echo "should_release=${{ steps.version.outputs.should_release }}"
+          echo "version=${{ steps.version.outputs.version }}"
+          echo "release_sha=${{ steps.version.outputs.release_sha }}"
+          echo "prerelease=${{ steps.version.outputs.prerelease }}"
+
+  docker-tarball:
+    needs: prepare
+    if: needs.prepare.outputs.should_release == 'true'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            arch_name: amd64
+          - platform: linux/arm64
+            arch_name: arm64
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare.outputs.release_sha }}
+          submodules: recursive
+
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build Docker tarball
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION="${{ needs.prepare.outputs.version }}"
+          mkdir -p "$RUNNER_TEMP/release-assets"
+          TAR_PATH="$RUNNER_TEMP/release-assets/btop-control-plane_${VERSION}_linux_${{ matrix.arch_name }}.docker.tar"
+          docker buildx build \
+            --platform "${{ matrix.platform }}" \
+            --target runtime \
+            --output "type=docker,dest=$TAR_PATH" \
+            -f control-plane/Dockerfile \
+            control-plane
+          gzip -f "$TAR_PATH"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: docker-${{ matrix.arch_name }}
+          path: ${{ runner.temp }}/release-assets/*
+          if-no-files-found: error
+
+  agent-build:
+    needs: prepare
+    if: needs.prepare.outputs.should_release == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            os_name: linux
+            arch_name: x86_64
+          - runner: macos-13
+            os_name: macos
+            arch_name: x86_64
+          - runner: macos-14
+            os_name: macos
+            arch_name: arm64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare.outputs.release_sha }}
+          submodules: recursive
+
+      - name: Install Ubuntu dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libcurl4-openssl-dev nlohmann-json3-dev
+
+      - name: Install macOS dependencies
+        if: runner.os == 'macOS'
+        run: |
+          brew update
+          brew install nlohmann-json
+
+      - name: Configure build
+        shell: bash
+        run: |
+          set -euo pipefail
+          cmake -S . -B build-release -DBUILD_TESTING=OFF -DCMAKE_BUILD_TYPE=Release -DBTOP_GPU=OFF
+
+      - name: Build agent
+        shell: bash
+        run: |
+          set -euo pipefail
+          cmake --build build-release --target btop-agent -j2
+
+      - name: Package agent
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION="${{ needs.prepare.outputs.version }}"
+          PACKAGE_DIR="$RUNNER_TEMP/btop-agent"
+          ARTIFACT_DIR="$RUNNER_TEMP/release-assets"
+          mkdir -p "$PACKAGE_DIR" "$ARTIFACT_DIR"
+          cp build-release/agent/btop-agent "$PACKAGE_DIR/"
+          cp control-plane/deploy/distributed-client.example.json "$PACKAGE_DIR/"
+          cp install.sh "$PACKAGE_DIR/"
+          tar -C "$RUNNER_TEMP" -czf \
+            "$ARTIFACT_DIR/btop-agent_${VERSION}_${{ matrix.os_name }}_${{ matrix.arch_name }}.tar.gz" \
+            btop-agent
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: agent-${{ matrix.os_name }}-${{ matrix.arch_name }}
+          path: ${{ runner.temp }}/release-assets/*
+          if-no-files-found: error
+
+  release:
+    needs:
+      - prepare
+      - docker-tarball
+      - agent-build
+    if: needs.prepare.outputs.should_release == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare.outputs.release_sha }}
+          submodules: recursive
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: downloaded-artifacts
+
+      - name: Assemble release assets
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p release-assets
+          find downloaded-artifacts -type f -exec cp {} release-assets/ \;
+          cp install.sh release-assets/install.sh
+          (
+            cd release-assets
+            find . -maxdepth 1 -type f ! -name 'SHA256SUMS.txt' -print0 \
+              | sort -z \
+              | xargs -0 shasum -a 256 \
+              | sed 's#  \./#  #'
+          ) > release-assets/SHA256SUMS.txt
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.prepare.outputs.version }}
+          target_commitish: ${{ needs.prepare.outputs.release_sha }}
+          name: ${{ needs.prepare.outputs.version }}
+          prerelease: ${{ needs.prepare.outputs.prerelease == 'true' }}
+          generate_release_notes: true
+          files: |
+            release-assets/**
+
+      - name: Print assets
+        shell: bash
+        run: find release-assets -type f | sort
