@@ -1,0 +1,16 @@
+.git
+.github
+.DS_Store
+build
+build_test
+data
+backend/.env
+backend/.venv
+backend/data/*.db
+frontend/dist
+frontend/node_modules
+frontend/*.tsbuildinfo
+**/__pycache__
+**/*.pyc
+**/*.pyo
+**/*.pyd

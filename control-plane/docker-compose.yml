@@ -1,0 +1,73 @@
+services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: runtime
+    image: btop-control-plane:local
+    ports:
+      - "${BTOP_HTTP_PORT:-9000}:9000"
+    environment:
+      BTOP_ENV: ${BTOP_ENV:-production}
+      BTOP_DATABASE_URL: ${BTOP_DATABASE_URL:-sqlite:////srv/btop/data/btop-control-plane.db}
+      BTOP_JWT_SECRET: ${BTOP_JWT_SECRET:-change-this-secret}
+      BTOP_JWT_EXPIRE_MINUTES: ${BTOP_JWT_EXPIRE_MINUTES:-720}
+      BTOP_BOOTSTRAP_ADMIN_USERNAME: ${BTOP_BOOTSTRAP_ADMIN_USERNAME:-admin}
+      BTOP_BOOTSTRAP_ADMIN_PASSWORD: ${BTOP_BOOTSTRAP_ADMIN_PASSWORD:-admin123456}
+      BTOP_CORS_ORIGINS: ${BTOP_CORS_ORIGINS:-http://localhost:9000}
+    volumes:
+      - btop-sqlite:/srv/btop/data
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:9000/healthz >/dev/null"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    restart: unless-stopped
+
+  backend-dev:
+    profiles: ["dev"]
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: backend-dev
+    working_dir: /workspace/backend
+    command: uvicorn app.main:app --reload --host 0.0.0.0 --port 9000
+    environment:
+      BTOP_ENV: development
+      BTOP_DATABASE_URL: ${BTOP_DEV_DATABASE_URL:-sqlite:///./data/btop-control-plane.db}
+      BTOP_JWT_SECRET: ${BTOP_JWT_SECRET:-change-this-secret}
+      BTOP_JWT_EXPIRE_MINUTES: ${BTOP_JWT_EXPIRE_MINUTES:-720}
+      BTOP_BOOTSTRAP_ADMIN_USERNAME: ${BTOP_BOOTSTRAP_ADMIN_USERNAME:-admin}
+      BTOP_BOOTSTRAP_ADMIN_PASSWORD: ${BTOP_BOOTSTRAP_ADMIN_PASSWORD:-admin123456}
+      BTOP_CORS_ORIGINS: ${BTOP_DEV_CORS_ORIGINS:-http://localhost:3001}
+    volumes:
+      - ./backend:/workspace/backend
+    ports:
+      - "9000:9000"
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"from urllib.request import urlopen; urlopen('http://127.0.0.1:9000/healthz')\" >/dev/null 2>&1"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+
+  frontend-dev:
+    profiles: ["dev"]
+    image: node:20-alpine
+    working_dir: /workspace/frontend
+    command: sh -c "npm ci && npm run dev -- --host 0.0.0.0 --strictPort"
+    environment:
+      CHOKIDAR_USEPOLLING: "true"
+    volumes:
+      - ./frontend:/workspace/frontend
+      - frontend-node-modules:/workspace/frontend/node_modules
+    ports:
+      - "3001:3001"
+    depends_on:
+      backend-dev:
+        condition: service_started
+
+volumes:
+  btop-sqlite:
+  frontend-node-modules:

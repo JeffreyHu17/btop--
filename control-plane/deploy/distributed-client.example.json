@@ -1,0 +1,13 @@
+{
+  "mode": "distributed",
+  "run_mode": "interactive",
+  "server_address": "control-plane.local",
+  "server_port": 9000,
+  "auth_token": "btop_replace_with_backend_generated_api_key",
+  "collection_interval_ms": 1000,
+  "enable_gpu": true,
+  "reconnect_delay_ms": 5000,
+  "max_reconnect_attempts": 10,
+  "log_file": "",
+  "pid_file": ""
+}
