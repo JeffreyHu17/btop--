@@ -16,11 +16,17 @@ CONFIG_ROOT=""
 CONFIG_PATH=""
 STATE_PATH=""
 BIN_PATH=""
+PATH_BIN_ROOT=""
+AGENT_ALIAS_PATH=""
+BTOP_ALIAS_PATH=""
 SERVICE_KIND="none"
 SERVICE_PATH=""
 PLIST_DOMAIN=""
 RELEASE_METADATA_FILE=""
 DOWNLOADED_ASSET_NAME=""
+PATH_UPDATE_NOTE=""
+BTOP_ALIAS_NOTE=""
+INSTALL_BTOP_ALIAS=1
 
 TEMP_DIR="$(mktemp -d)"
 trap 'rm -rf "$TEMP_DIR"' EXIT
@@ -210,6 +216,39 @@ detect_platform() {
   esac
 }
 
+ensure_user_shell_path() {
+  if [[ "$(id -u)" -eq 0 ]]; then
+    return 0
+  fi
+  if [[ ":$PATH:" == *":$PATH_BIN_ROOT:"* ]]; then
+    return 0
+  fi
+
+  local path_export_line="export PATH=\"$PATH_BIN_ROOT:\$PATH\""
+  local marker="# Added by btop-agent installer"
+  local profile_files=("$HOME/.profile")
+
+  case "${SHELL##*/}" in
+    zsh) profile_files+=("$HOME/.zprofile" "$HOME/.zshrc") ;;
+    bash) profile_files+=("$HOME/.bash_profile" "$HOME/.bashrc") ;;
+  esac
+
+  local profile_file
+  for profile_file in "${profile_files[@]}"; do
+    [[ -n "$profile_file" ]] || continue
+    mkdir -p "$(dirname "$profile_file")"
+    touch "$profile_file"
+    if ! grep -Fq "$path_export_line" "$profile_file"; then
+      {
+        printf '\n%s\n' "$marker"
+        printf '%s\n' "$path_export_line"
+      } >> "$profile_file"
+    fi
+  done
+
+  PATH_UPDATE_NOTE="Added $PATH_BIN_ROOT to your shell startup files. Open a new shell after install to use 'btop' directly."
+}
+
 resolve_roots() {
   if [[ "$PLATFORM_OS" == "linux" ]]; then
     if ! command -v systemctl >/dev/null 2>&1 || [[ ! -d /run/systemd/system ]]; then
@@ -218,11 +257,13 @@ resolve_roots() {
     if [[ "$(id -u)" -eq 0 ]]; then
       INSTALL_ROOT="/opt/btop-agent"
       CONFIG_ROOT="/etc/btop-agent"
+      PATH_BIN_ROOT="/usr/local/bin"
       SERVICE_KIND="systemd-system"
       SERVICE_PATH="/etc/systemd/system/${SERVICE_NAME}.service"
     else
       INSTALL_ROOT="$HOME/.local/share/btop-agent"
       CONFIG_ROOT="$HOME/.config/btop-agent"
+      PATH_BIN_ROOT="$HOME/.local/bin"
       SERVICE_KIND="systemd-user"
       SERVICE_PATH="$HOME/.config/systemd/user/${SERVICE_NAME}.service"
     fi
@@ -230,12 +271,14 @@ resolve_roots() {
     if [[ "$(id -u)" -eq 0 ]]; then
       INSTALL_ROOT="/usr/local/lib/btop-agent"
       CONFIG_ROOT="/usr/local/etc/btop-agent"
+      PATH_BIN_ROOT="/usr/local/bin"
       SERVICE_KIND="launchd-system"
       SERVICE_PATH="/Library/LaunchDaemons/io.github.jeffreyhu.btop-agent.plist"
       PLIST_DOMAIN="system"
     else
       INSTALL_ROOT="$HOME/.local/share/btop-agent"
       CONFIG_ROOT="$HOME/.config/btop-agent"
+      PATH_BIN_ROOT="$HOME/.local/bin"
       SERVICE_KIND="launchd-user"
       SERVICE_PATH="$HOME/Library/LaunchAgents/io.github.jeffreyhu.btop-agent.plist"
       PLIST_DOMAIN="gui/$(id -u)"
@@ -245,6 +288,8 @@ resolve_roots() {
   CONFIG_PATH="$CONFIG_ROOT/distributed-client.json"
   STATE_PATH="$CONFIG_ROOT/install-state.json"
   BIN_PATH="$INSTALL_ROOT/btop-agent"
+  AGENT_ALIAS_PATH="$PATH_BIN_ROOT/btop-agent"
+  BTOP_ALIAS_PATH="$PATH_BIN_ROOT/btop"
 }
 
 read_json_field() {
@@ -271,16 +316,41 @@ else:
 PY
 }
 
+format_http_host() {
+  local host="$1"
+  if [[ "$host" == *:* && "$host" != \[*\] ]]; then
+    printf '[%s]' "$host"
+  else
+    printf '%s' "$host"
+  fi
+}
+
+is_managed_alias_path() {
+  local alias_path="$1"
+  [[ -L "$alias_path" ]] || return 1
+  [[ "$(readlink "$alias_path")" == "$BIN_PATH" ]]
+}
+
 split_endpoint() {
   local raw="$1"
   python3 - "$raw" <<'PY'
 import sys
 from urllib.parse import urlparse
 raw = sys.argv[1].strip()
+if raw.count(':') > 1 and '://' not in raw and not raw.startswith('['):
+    print('')
+    print(raw)
+    print('')
+    sys.exit(0)
 parsed = urlparse(raw if '://' in raw else f'//{raw}')
 scheme = parsed.scheme or ''
 host = parsed.hostname or ''
-port = str(parsed.port or '')
+try:
+    port_value = parsed.port
+except ValueError:
+    sys.stderr.write('invalid control plane port\n')
+    sys.exit(1)
+port = str(port_value or '')
 if not host and raw and '://' not in raw:
     host = raw
 print(scheme)
@@ -434,6 +504,8 @@ write_state_file() {
   BTOP_STATE_CONFIG_PATH="$CONFIG_PATH" \
   BTOP_STATE_SERVICE_KIND="$SERVICE_KIND" \
   BTOP_STATE_SERVICE_PATH="$SERVICE_PATH" \
+  BTOP_STATE_AGENT_ALIAS_PATH="$AGENT_ALIAS_PATH" \
+  BTOP_STATE_BTOP_ALIAS_PATH="$BTOP_ALIAS_PATH" \
   python3 - <<'PY'
 import json
 import os
@@ -447,11 +519,69 @@ path.write_text(json.dumps(
         "config_path": os.environ["BTOP_STATE_CONFIG_PATH"],
         "service_kind": os.environ["BTOP_STATE_SERVICE_KIND"],
         "service_path": os.environ["BTOP_STATE_SERVICE_PATH"],
+        "agent_alias_path": os.environ["BTOP_STATE_AGENT_ALIAS_PATH"],
+        "btop_alias_path": os.environ["BTOP_STATE_BTOP_ALIAS_PATH"],
     },
     indent=2,
 ) + "\n")
 PY
   set_private_file_permissions "$STATE_PATH"
+}
+
+refresh_command_aliases() {
+  mkdir -p "$PATH_BIN_ROOT"
+  validate_alias_paths
+  ln -sfn "$BIN_PATH" "$AGENT_ALIAS_PATH"
+  if [[ "$INSTALL_BTOP_ALIAS" == "1" ]]; then
+    ln -sfn "$BIN_PATH" "$BTOP_ALIAS_PATH"
+  fi
+}
+
+validate_alias_paths() {
+  INSTALL_BTOP_ALIAS=1
+  BTOP_ALIAS_NOTE=""
+  if [[ -e "$AGENT_ALIAS_PATH" && ! -L "$AGENT_ALIAS_PATH" ]]; then
+    die "refusing to replace existing non-symlink path: $AGENT_ALIAS_PATH"
+  fi
+  if [[ -L "$AGENT_ALIAS_PATH" ]] && ! is_managed_alias_path "$AGENT_ALIAS_PATH"; then
+    die "refusing to replace existing symlink not managed by this install: $AGENT_ALIAS_PATH"
+  fi
+  if [[ -e "$BTOP_ALIAS_PATH" && ! -L "$BTOP_ALIAS_PATH" ]]; then
+    INSTALL_BTOP_ALIAS=0
+    BTOP_ALIAS_NOTE="Existing btop command preserved at $BTOP_ALIAS_PATH. Use 'btop-agent tui' for the fused TUI."
+    return 0
+  fi
+  if [[ -L "$BTOP_ALIAS_PATH" ]] && ! is_managed_alias_path "$BTOP_ALIAS_PATH"; then
+    INSTALL_BTOP_ALIAS=0
+    BTOP_ALIAS_NOTE="Existing btop symlink preserved at $BTOP_ALIAS_PATH. Use 'btop-agent tui' for the fused TUI."
+  fi
+}
+
+cleanup_partial_install() {
+  stop_service >/dev/null 2>&1 || true
+  case "$SERVICE_KIND" in
+    systemd-system)
+      systemctl disable "$SERVICE_NAME" >/dev/null 2>&1 || true
+      ;;
+    systemd-user)
+      systemctl --user disable "$SERVICE_NAME" >/dev/null 2>&1 || true
+      ;;
+  esac
+  [[ -f "$SERVICE_PATH" ]] && rm -f "$SERVICE_PATH"
+  case "$SERVICE_KIND" in
+    systemd-system)
+      systemctl daemon-reload >/dev/null 2>&1 || true
+      ;;
+    systemd-user)
+      systemctl --user daemon-reload >/dev/null 2>&1 || true
+      ;;
+  esac
+  is_managed_alias_path "$AGENT_ALIAS_PATH" && rm -f "$AGENT_ALIAS_PATH"
+  is_managed_alias_path "$BTOP_ALIAS_PATH" && rm -f "$BTOP_ALIAS_PATH"
+  [[ -f "$BIN_PATH" ]] && rm -f "$BIN_PATH"
+  [[ -f "$CONFIG_PATH" ]] && rm -f "$CONFIG_PATH"
+  [[ -f "$INSTALL_ROOT/distributed-client.example.json" ]] && rm -f "$INSTALL_ROOT/distributed-client.example.json"
+  [[ -f "$STATE_PATH" ]] && rm -f "$STATE_PATH"
 }
 
 service_status() {
@@ -583,7 +713,7 @@ preflight_connectivity() {
   host="$(read_json_field "$config_path" server_address)"
   port="$(read_json_field "$config_path" server_port)"
   token="$(read_json_field "$config_path" auth_token)"
-  base_url="http://${host}:${port}"
+  base_url="http://$(format_http_host "$host"):${port}"
 
   curl -fsSL "$base_url/api/ping" >/dev/null
   curl -fsSL -H "Authorization: Bearer $token" "$base_url/api/auth/status" >/dev/null
@@ -604,6 +734,10 @@ prepare_archive_contents() {
   [[ -x "$stage_dir/btop-agent/btop-agent" ]] || die "archive is missing btop-agent executable"
   [[ -f "$stage_dir/btop-agent/distributed-client.example.json" ]] || die "archive is missing distributed-client.example.json"
   "$stage_dir/btop-agent/btop-agent" --help >/dev/null
+  local alias_dir="$stage_dir/alias-check"
+  mkdir -p "$alias_dir"
+  ln -s "$stage_dir/btop-agent/btop-agent" "$alias_dir/btop"
+  "$alias_dir/btop" --help >/dev/null
   printf '%s' "$stage_dir/btop-agent"
 }
 
@@ -612,32 +746,62 @@ install_archive_contents() {
   mkdir -p "$INSTALL_ROOT"
   install -m 755 "$stage_dir/btop-agent" "$BIN_PATH"
   install -m 644 "$stage_dir/distributed-client.example.json" "$INSTALL_ROOT/distributed-client.example.json"
+  refresh_command_aliases
 }
 
 install_action() {
   detect_platform
   resolve_roots
+  validate_alias_paths
+  if [[ -f "$BIN_PATH" || -e "$AGENT_ALIAS_PATH" ]] || is_managed_alias_path "$BTOP_ALIAS_PATH"; then
+    die "agent already appears to be installed at $BIN_PATH; use update or uninstall first"
+  fi
   fetch_release_metadata
-  local archive_path stage_dir
+  local archive_path stage_dir candidate_config existing_config_backup
   archive_path="$(download_asset)"
   verify_asset_checksum "$archive_path"
   stage_dir="$(prepare_archive_contents "$archive_path")"
-  install_archive_contents "$stage_dir"
-  write_config_interactive
-  preflight_connectivity
-  validate_agent_once
-  write_service_definition
-  start_service
-  write_state_file
+  candidate_config="$TEMP_DIR/distributed-client.candidate.json"
+  existing_config_backup="$TEMP_DIR/distributed-client.existing.json"
+  [[ -f "$CONFIG_PATH" ]] && cp "$CONFIG_PATH" "$existing_config_backup"
+  write_config_interactive "$candidate_config"
+  preflight_connectivity "$candidate_config"
+  validate_agent_once "$stage_dir/btop-agent" "$candidate_config"
+
+  if install_archive_contents "$stage_dir" \
+    && ensure_private_dir "$CONFIG_ROOT" \
+    && install -m 600 "$candidate_config" "$CONFIG_PATH" \
+    && write_service_definition \
+    && start_service \
+    && write_state_file; then
+    :
+  else
+    cleanup_partial_install
+    if [[ -f "$existing_config_backup" ]]; then
+      ensure_private_dir "$CONFIG_ROOT"
+      install -m 600 "$existing_config_backup" "$CONFIG_PATH"
+    fi
+    die "install failed and partial files were removed"
+  fi
+  ensure_user_shell_path
   log "Installed $SERVICE_NAME $RESOLVED_VERSION"
   log "Binary: $BIN_PATH"
+  log "Agent alias: $AGENT_ALIAS_PATH"
+  log "TUI alias: $BTOP_ALIAS_PATH"
   log "Config: $CONFIG_PATH"
+  if [[ -n "$PATH_UPDATE_NOTE" ]]; then
+    log "$PATH_UPDATE_NOTE"
+  fi
+  if [[ -n "$BTOP_ALIAS_NOTE" ]]; then
+    log "$BTOP_ALIAS_NOTE"
+  fi
 }
 
 update_action() {
   detect_platform
   resolve_roots
   [[ -f "$BIN_PATH" ]] || die "agent is not installed at $BIN_PATH"
+  validate_alias_paths
   fetch_release_metadata
   local archive_path stage_dir backup_bin backup_example backup_service backup_state
   archive_path="$(download_asset)"
@@ -705,9 +869,13 @@ status_action() {
   detect_platform
   resolve_roots
   log "Binary: ${BIN_PATH}"
+  log "Agent alias: ${AGENT_ALIAS_PATH}"
+  log "TUI alias: ${BTOP_ALIAS_PATH}"
   log "Config: ${CONFIG_PATH}"
   log "State: ${STATE_PATH}"
   log "Installed: $( [[ -f "$BIN_PATH" ]] && printf 'yes' || printf 'no' )"
+  log "Agent alias present: $( [[ -L "$AGENT_ALIAS_PATH" ]] && printf 'yes' || printf 'no' )"
+  log "TUI alias present: $( [[ -L "$BTOP_ALIAS_PATH" ]] && printf 'yes' || printf 'no' )"
   log "Config present: $( [[ -f "$CONFIG_PATH" ]] && printf 'yes' || printf 'no' )"
   log "Service: $(service_status)"
   if [[ -f "$STATE_PATH" ]]; then
@@ -728,10 +896,13 @@ uninstall_action() {
       ;;
   esac
   [[ -f "$SERVICE_PATH" ]] && rm -f "$SERVICE_PATH"
+  is_managed_alias_path "$AGENT_ALIAS_PATH" && rm -f "$AGENT_ALIAS_PATH"
+  is_managed_alias_path "$BTOP_ALIAS_PATH" && rm -f "$BTOP_ALIAS_PATH"
   [[ -f "$BIN_PATH" ]] && rm -f "$BIN_PATH"
   [[ -f "$INSTALL_ROOT/distributed-client.example.json" ]] && rm -f "$INSTALL_ROOT/distributed-client.example.json"
   [[ -f "$STATE_PATH" ]] && rm -f "$STATE_PATH"
   rmdir "$INSTALL_ROOT" >/dev/null 2>&1 || true
+  rmdir "$PATH_BIN_ROOT" >/dev/null 2>&1 || true
   if prompt_yes_no 'Remove config file too?' 'N'; then
     rm -f "$CONFIG_PATH"
   fi

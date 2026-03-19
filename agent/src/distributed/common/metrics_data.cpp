@@ -132,9 +132,11 @@ void to_json(nlohmann::json& j, const MetricsData::ProcessMetrics& processes) {
         {"load_average_1min", processes.load_average_1min},
         {"load_average_5min", processes.load_average_5min},
         {"load_average_15min", processes.load_average_15min},
-        {"top_processes", processes.top_processes},
-        {"all_processes", processes.all_processes}
+        {"top_processes", processes.top_processes}
     };
+    if (!processes.all_processes.empty()) {
+        j["all_processes"] = processes.all_processes;
+    }
 }
 
 void from_json(const nlohmann::json& j, MetricsData::ProcessMetrics& processes) {

@@ -7,6 +7,8 @@
 
 namespace btop::distributed::client {
 
+bool isShutdownRequested();
+
 /**
  * @brief Daemon mode manager for btop_client
  *
@@ -24,6 +26,7 @@ public:
     void setupSignalHandlers();
     void redirectOutput(const std::string& log_file_path);
     bool isRunningAsDaemon() const;
+    bool shutdownRequested() const;
     void gracefulShutdown();
 
 private:

@@ -1,5 +1,6 @@
 #ifdef DISTRIBUTED_MONITORING
 
+#include "daemon_manager.hpp"
 #include "network_client.hpp"
 #include "../common/auth_interface.hpp"
 #include <curl/curl.h>
@@ -26,8 +27,12 @@ struct CurlResponse {
         size_t total_size = size * nmemb;
         response->data.append(static_cast<char*>(contents), total_size);
         return total_size;
-    }
+	}
 };
+
+int shutdownAwareProgressCallback(void* /*clientp*/, curl_off_t /*dltotal*/, curl_off_t /*dlnow*/, curl_off_t /*ultotal*/, curl_off_t /*ulnow*/) {
+	return isShutdownRequested() ? 1 : 0;
+}
 
 class NetworkClient::Impl {
 public:
@@ -35,22 +40,25 @@ public:
              last_auth_result_(AuthResult::SUCCESS),
              connection_timeout_(std::chrono::seconds(30)),
              reconnect_delay_(std::chrono::seconds(5)),
-             max_buffer_size_(1000), retry_attempts_(0), max_retry_attempts_(5),
+	             max_buffer_size_(1000), retry_attempts_(0), max_retry_attempts_(5),
              base_retry_delay_(std::chrono::seconds(1)) {
         // Initialize libcurl
         curl_global_init(CURL_GLOBAL_DEFAULT);
         curl_ = curl_easy_init();
         
-        if (curl_) {
-            // Set common options
-            curl_easy_setopt(curl_, CURLOPT_WRITEFUNCTION, CurlResponse::WriteCallback);
-            curl_easy_setopt(curl_, CURLOPT_FOLLOWLOCATION, 1L);
-            curl_easy_setopt(curl_, CURLOPT_TIMEOUT, connection_timeout_.count());
-            curl_easy_setopt(curl_, CURLOPT_CONNECTTIMEOUT, 10L);
-            curl_easy_setopt(curl_, CURLOPT_USERAGENT, "btop-client/1.0");
-            curl_easy_setopt(curl_, CURLOPT_PROXY, "");
-        }
-    }
+	        if (curl_) {
+	            // Set common options
+	            curl_easy_setopt(curl_, CURLOPT_WRITEFUNCTION, CurlResponse::WriteCallback);
+	            curl_easy_setopt(curl_, CURLOPT_FOLLOWLOCATION, 1L);
+	            curl_easy_setopt(curl_, CURLOPT_TIMEOUT, connection_timeout_.count());
+	            curl_easy_setopt(curl_, CURLOPT_CONNECTTIMEOUT, 10L);
+	            curl_easy_setopt(curl_, CURLOPT_NOSIGNAL, 1L);
+	            curl_easy_setopt(curl_, CURLOPT_USERAGENT, "btop-client/1.0");
+	            curl_easy_setopt(curl_, CURLOPT_PROXY, "");
+	            curl_easy_setopt(curl_, CURLOPT_NOPROGRESS, 0L);
+	            curl_easy_setopt(curl_, CURLOPT_XFERINFOFUNCTION, shutdownAwareProgressCallback);
+	        }
+	    }
     
     ~Impl() {
         if (curl_) {
@@ -59,10 +67,13 @@ public:
         curl_global_cleanup();
     }
     
-    bool connect(const std::string& address, uint16_t port) {
-        if (!curl_) {
-            return false;
-        }
+	    bool connect(const std::string& address, uint16_t port) {
+	        if (!curl_) {
+	            return false;
+	        }
+	        if (isShutdownRequested()) {
+	            return false;
+	        }
         
         server_address_ = address;
         server_port_ = port;
@@ -87,17 +98,19 @@ public:
         
         CURLcode res = curl_easy_perform(curl_);
         
-        if (res == CURLE_OK) {
-            curl_easy_getinfo(curl_, CURLINFO_RESPONSE_CODE, &response.response_code);
+	        if (res == CURLE_OK) {
+	            curl_easy_getinfo(curl_, CURLINFO_RESPONSE_CODE, &response.response_code);
             // Accept 200 (OK) or 404 (endpoint not found, but server is responding)
             connected_ = (response.response_code == 200 || response.response_code == 404);
             if (!connected_) {
                 std::cerr << "ping failed with HTTP " << response.response_code << std::endl;
             }
-        } else {
-            std::cerr << "ping CURL error: " << curl_easy_strerror(res) << std::endl;
-            connected_ = false;
-        }
+	        } else if (res == CURLE_ABORTED_BY_CALLBACK && isShutdownRequested()) {
+	            connected_ = false;
+	        } else {
+	            std::cerr << "ping CURL error: " << curl_easy_strerror(res) << std::endl;
+	            connected_ = false;
+	        }
         
         return connected_;
     }
@@ -112,8 +125,8 @@ public:
         return authenticateWithCredentials(creds);
     }
     
-    bool authenticateWithCredentials(const Credentials& credentials) {
-        if (!connected_ || !curl_) {
+	    bool authenticateWithCredentials(const Credentials& credentials) {
+	        if (!connected_ || !curl_) {
             last_auth_result_ = AuthResult::NETWORK_ERROR;
             return false;
         }
@@ -162,7 +175,7 @@ private:
         return headers;
     }
 
-    bool performServerAuthentication(const Credentials& credentials) {
+	    bool performServerAuthentication(const Credentials& credentials) {
         // Test authentication with a protected endpoint
         std::string auth_url = base_url_ + "/api/auth/status";
         
@@ -179,8 +192,8 @@ private:
         
         curl_slist_free_all(headers);
         
-        if (res == CURLE_OK) {
-            curl_easy_getinfo(curl_, CURLINFO_RESPONSE_CODE, &response.response_code);
+	        if (res == CURLE_OK) {
+	            curl_easy_getinfo(curl_, CURLINFO_RESPONSE_CODE, &response.response_code);
             if (response.response_code != 200) {
                 std::cerr << "authentication failed with HTTP " << response.response_code;
                 if (!response.data.empty()) {
@@ -189,17 +202,23 @@ private:
                 std::cerr << std::endl;
             }
             return (response.response_code == 200);
-        }
-        
-        std::cerr << "authentication CURL error: " << curl_easy_strerror(res) << std::endl;
-        return false;
+	        }
+	        if (res == CURLE_ABORTED_BY_CALLBACK && isShutdownRequested()) {
+	            return false;
+	        }
+	        
+	        std::cerr << "authentication CURL error: " << curl_easy_strerror(res) << std::endl;
+	        return false;
     }
 
 public:
-    std::optional<RemoteAgentConfig> fetchAgentConfig(const std::string& hostname) {
-        if (!connected_ || !curl_ || !current_credentials_ || hostname.empty()) {
-            return std::nullopt;
-        }
+	    std::optional<RemoteAgentConfig> fetchAgentConfig(const std::string& hostname) {
+	        if (!connected_ || !curl_ || !current_credentials_ || hostname.empty()) {
+	            return std::nullopt;
+	        }
+	        if (isShutdownRequested()) {
+	            return std::nullopt;
+	        }
 
         char* escaped_hostname = curl_easy_escape(curl_, hostname.c_str(), static_cast<int>(hostname.size()));
         if (escaped_hostname == nullptr) {
@@ -219,10 +238,14 @@ public:
         CURLcode res = curl_easy_perform(curl_);
         curl_slist_free_all(headers);
 
-        if (res != CURLE_OK) {
-            std::cerr << "config fetch CURL error: " << curl_easy_strerror(res) << std::endl;
-            connected_ = false;
-            return std::nullopt;
+	        if (res != CURLE_OK) {
+	            if (res == CURLE_ABORTED_BY_CALLBACK && isShutdownRequested()) {
+	                connected_ = false;
+	                return std::nullopt;
+	            }
+	            std::cerr << "config fetch CURL error: " << curl_easy_strerror(res) << std::endl;
+	            connected_ = false;
+	            return std::nullopt;
         }
 
         curl_easy_getinfo(curl_, CURLINFO_RESPONSE_CODE, &response.response_code);
@@ -257,9 +280,12 @@ public:
         return config;
     }
 
-    bool sendMetrics(const MetricsData& data) {
-        // Always try to send buffered data first
-        processPendingMetrics();
+	    bool sendMetrics(const MetricsData& data) {
+	        if (isShutdownRequested()) {
+	            return false;
+	        }
+	        // Always try to send buffered data first
+	        processPendingMetrics();
         
         if (!connected_ || !curl_) {
             // Buffer the data if not connected
@@ -318,8 +344,8 @@ private:
             
             curl_slist_free_all(headers);
             
-            if (res == CURLE_OK) {
-                curl_easy_getinfo(curl_, CURLINFO_RESPONSE_CODE, &response.response_code);
+	            if (res == CURLE_OK) {
+	                curl_easy_getinfo(curl_, CURLINFO_RESPONSE_CODE, &response.response_code);
                 bool success = (response.response_code >= 200 && response.response_code < 300);
                 
                 if (!success) {
@@ -333,8 +359,11 @@ private:
                 }
                 
                 return success;
-            } else {
-                std::cerr << "metrics upload CURL error: " << curl_easy_strerror(res) << std::endl;
+	            } else if (res == CURLE_ABORTED_BY_CALLBACK && isShutdownRequested()) {
+	                connected_ = false;
+	                return false;
+	            } else {
+	                std::cerr << "metrics upload CURL error: " << curl_easy_strerror(res) << std::endl;
                 // Network error, mark as disconnected
                 connected_ = false;
                 return false;
@@ -345,11 +374,10 @@ private:
         }
     }
     
-    void bufferMetrics(const MetricsData& data) {
-        std::lock_guard<std::mutex> lock(buffer_mutex_);
-        
-        // Add to buffer
-        metrics_buffer_.push(data);
+	    void bufferMetrics(const MetricsData& data) {
+	        std::lock_guard<std::mutex> lock(buffer_mutex_);
+	        
+	        metrics_buffer_.push(data);
         
         // Enforce buffer size limit (remove oldest if necessary)
         while (metrics_buffer_.size() > max_buffer_size_) {
@@ -357,16 +385,19 @@ private:
         }
     }
     
-    void processPendingMetrics() {
-        if (!connected_ || !curl_) {
-            return;
-        }
+	    void processPendingMetrics() {
+	        if (!connected_ || !curl_ || isShutdownRequested()) {
+	            return;
+	        }
         
         std::lock_guard<std::mutex> lock(buffer_mutex_);
         
         // Send all buffered metrics
-        while (!metrics_buffer_.empty() && connected_) {
-            const MetricsData& buffered_data = metrics_buffer_.front();
+	        while (!metrics_buffer_.empty() && connected_) {
+	            if (isShutdownRequested()) {
+	                break;
+	            }
+	            const MetricsData& buffered_data = metrics_buffer_.front();
             
             if (sendMetricsInternal(buffered_data)) {
                 metrics_buffer_.pop();
@@ -377,21 +408,27 @@ private:
         }
     }
     
-    void attemptReconnectWithBackoff() {
-        if (retry_attempts_ >= max_retry_attempts_) {
-            return; // Max attempts reached
-        }
-        
-        // Calculate exponential backoff delay
-        auto delay = calculateBackoffDelay();
-        
-        // Sleep for the calculated delay
-        std::this_thread::sleep_for(delay);
-        
-        retry_attempts_++;
-        
-        // Try to reconnect
-        if (attemptReconnect()) {
+	    void attemptReconnectWithBackoff() {
+	        if (retry_attempts_ >= max_retry_attempts_ || isShutdownRequested()) {
+	            return; // Max attempts reached
+	        }
+	        
+	        // Calculate exponential backoff delay
+	        auto delay = calculateBackoffDelay();
+	        constexpr auto poll_interval = std::chrono::milliseconds(250);
+	        auto deadline = std::chrono::steady_clock::now() + delay;
+	        while (std::chrono::steady_clock::now() < deadline) {
+	            if (isShutdownRequested()) {
+	                return;
+	            }
+	            const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - std::chrono::steady_clock::now());
+	            std::this_thread::sleep_for(std::min(poll_interval, remaining));
+	        }
+	        
+	        retry_attempts_++;
+	        
+	        // Try to reconnect
+	        if (!isShutdownRequested() && attemptReconnect()) {
             retry_attempts_ = 0; // Reset on successful reconnection
             
             // Notify callback if set
