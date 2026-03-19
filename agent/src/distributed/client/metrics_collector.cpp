@@ -21,8 +21,20 @@
 #include <thread>
 #include <cwchar>
 #ifdef _WIN32
+#ifndef _WIN32_WINNT
+#define _WIN32_WINNT 0x0600
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <winsock2.h>
+#include <ws2tcpip.h>
 #include <windows.h>
 #include <iphlpapi.h>
+#include <netioapi.h>
 #elif defined(__APPLE__) || defined(__FreeBSD__) || defined(__NetBSD__) || defined(__OpenBSD__)
 #include <ifaddrs.h>
 #include <net/if.h>
@@ -148,7 +160,7 @@ auto MetricsCollector::collect() -> MetricsData {
 	}
 	data.cpu.frequency_mhz = parseFrequencyMHz(Cpu::cpuHz);
 
-	data.memory.total_bytes = Mem::get_totalMem();
+	data.memory.total_bytes = mem.stats.at("total");
 	data.memory.used_bytes = mem.stats.at("used");
 	data.memory.available_bytes = mem.stats.at("available");
 	data.memory.cached_bytes = mem.stats.at("cached");
