@@ -55,6 +55,9 @@ if(WIN32)
     "${BTOP4WIN_SOURCE_DIR}/src"
     "${BTOP4WIN_SOURCE_DIR}/include"
   )
+  target_compile_options(btop-tui-obj PRIVATE
+    $<$<CXX_COMPILER_ID:MSVC>:/wd4715 /WX->
+  )
 else()
   set(BTOP_UPSTREAM_SOURCE_DIR "${CMAKE_CURRENT_LIST_DIR}/../btop" CACHE PATH "Path to the upstream btop source tree")
   set(BTOP_UPSTREAM_BINARY_DIR "${CMAKE_BINARY_DIR}/btop-upstream")
@@ -68,6 +71,11 @@ else()
   set(BTOP_DISTRIBUTED OFF CACHE BOOL "Disable in-tree distributed monitoring targets" FORCE)
 
   add_subdirectory("${BTOP_UPSTREAM_SOURCE_DIR}" "${BTOP_UPSTREAM_BINARY_DIR}")
+  if(APPLE)
+    target_compile_options(libbtop PRIVATE
+      $<$<CXX_COMPILER_ID:Clang>:-Wno-invalid-constexpr>
+    )
+  endif()
 endif()
 
 add_executable(btop-agent ${BTOP_AGENT_SOURCES})
