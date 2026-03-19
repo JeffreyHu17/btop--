@@ -140,13 +140,13 @@ jobs:
           - runner: macos-15-intel
             os_name: macos
             arch_name: x86_64
-            c_compiler: clang
-            cxx_compiler: clang++
+            c_compiler: /usr/bin/clang
+            cxx_compiler: /usr/bin/clang++
           - runner: macos-15
             os_name: macos
             arch_name: arm64
-            c_compiler: clang
-            cxx_compiler: clang++
+            c_compiler: /usr/bin/clang
+            cxx_compiler: /usr/bin/clang++
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v6

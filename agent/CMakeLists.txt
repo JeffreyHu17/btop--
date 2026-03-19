@@ -45,11 +45,8 @@ if(WIN32)
   )
   target_compile_definitions(btop-tui-obj PRIVATE
     main=btop4win_main
-    _WIN32_DCOM
-    _WIN32_WINNT=0x0600
-    NOMINMAX
-    WIN32_LEAN_AND_MEAN
-    VC_EXTRALEAN
+    UNICODE
+    _UNICODE
   )
   target_include_directories(btop-tui-obj PRIVATE
     "${BTOP4WIN_SOURCE_DIR}/src"
