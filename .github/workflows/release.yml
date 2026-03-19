@@ -8,6 +8,9 @@ on:
 permissions:
   contents: write
 
+env:
+  VCPKG_REF: 2025.12.12
+
 jobs:
   prepare:
     runs-on: ubuntu-latest
@@ -122,7 +125,7 @@ jobs:
           path: ${{ runner.temp }}/release-assets/*
           if-no-files-found: error
 
-  agent-build:
+  agent-build-unix:
     needs: prepare
     if: needs.prepare.outputs.should_release == 'true'
     strategy:
@@ -180,6 +183,17 @@ jobs:
           set -euo pipefail
           cmake --build build-release --target btop-agent -j2
 
+      - name: Smoke test fused entrypoints
+        shell: bash
+        run: |
+          set -euo pipefail
+          build-release/agent/btop-agent --help >/dev/null
+          alias_dir="$RUNNER_TEMP/alias-check"
+          mkdir -p "$alias_dir"
+          ln -s "$(pwd)/build-release/agent/btop-agent" "$alias_dir/btop"
+          "$alias_dir/btop" --help >/dev/null
+          build-release/agent/btop-agent tui --help >/dev/null
+
       - name: Package agent
         shell: bash
         run: |
@@ -201,11 +215,102 @@ jobs:
           path: ${{ runner.temp }}/release-assets/*
           if-no-files-found: error
 
+  agent-build-windows:
+    needs: prepare
+    if: needs.prepare.outputs.should_release == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch_name: x86_64
+            cmake_arch: x64
+            vcpkg_triplet: x64-windows-static
+            smoke_test: true
+          - arch_name: x86
+            cmake_arch: Win32
+            vcpkg_triplet: x86-windows-static
+            smoke_test: true
+          - arch_name: arm64
+            cmake_arch: ARM64
+            vcpkg_triplet: arm64-windows-static
+            smoke_test: false
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.prepare.outputs.release_sha }}
+          submodules: recursive
+
+      - name: Install Windows dependencies
+        shell: pwsh
+        run: |
+          $vcpkgRoot = $env:VCPKG_INSTALLATION_ROOT
+          if (-not $vcpkgRoot) {
+            $vcpkgRoot = Join-Path $env:RUNNER_TEMP 'vcpkg'
+            if (-not (Test-Path -LiteralPath $vcpkgRoot)) {
+              git clone --depth 1 --branch $env:VCPKG_REF https://github.com/microsoft/vcpkg $vcpkgRoot
+              & (Join-Path $vcpkgRoot 'bootstrap-vcpkg.bat') -disableMetrics
+            }
+            "VCPKG_INSTALLATION_ROOT=$vcpkgRoot" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          }
+          & (Join-Path $vcpkgRoot 'vcpkg.exe') install "curl:${{ matrix.vcpkg_triplet }}" "nlohmann-json:${{ matrix.vcpkg_triplet }}"
+
+      - name: Configure build
+        shell: pwsh
+        run: |
+          $vcpkgRoot = $env:VCPKG_INSTALLATION_ROOT
+          if (-not $vcpkgRoot) {
+            throw 'VCPKG_INSTALLATION_ROOT is not available after dependency bootstrap'
+          }
+          cmake -S . -B build-release `
+            -G "Visual Studio 17 2022" `
+            -A "${{ matrix.cmake_arch }}" `
+            -DCMAKE_BUILD_TYPE=Release `
+            -DBUILD_TESTING=OFF `
+            -DCMAKE_TOOLCHAIN_FILE="$vcpkgRoot/scripts/buildsystems/vcpkg.cmake" `
+            -DVCPKG_TARGET_TRIPLET=${{ matrix.vcpkg_triplet }}
+
+      - name: Build agent
+        shell: pwsh
+        run: |
+          cmake --build build-release --config Release --target btop-agent
+
+      - name: Smoke test fused entrypoints
+        if: matrix.smoke_test
+        shell: pwsh
+        run: |
+          $binary = Join-Path $PWD 'build-release/agent/Release/btop-agent.exe'
+          & $binary --help | Out-Null
+          $alias = Join-Path $env:RUNNER_TEMP 'btop.exe'
+          Copy-Item -LiteralPath $binary -Destination $alias -Force
+          & $alias --help | Out-Null
+          & $binary tui --help | Out-Null
+
+      - name: Package agent
+        shell: pwsh
+        run: |
+          $version = '${{ needs.prepare.outputs.version }}'
+          $packageDir = Join-Path $env:RUNNER_TEMP 'btop-agent'
+          $artifactDir = Join-Path $env:RUNNER_TEMP 'release-assets'
+          New-Item -ItemType Directory -Path $packageDir -Force | Out-Null
+          New-Item -ItemType Directory -Path $artifactDir -Force | Out-Null
+          Copy-Item -LiteralPath 'build-release/agent/Release/btop-agent.exe' -Destination (Join-Path $packageDir 'btop-agent.exe') -Force
+          Copy-Item -LiteralPath 'control-plane/deploy/distributed-client.example.json' -Destination (Join-Path $packageDir 'distributed-client.example.json') -Force
+          Copy-Item -LiteralPath 'install.ps1' -Destination (Join-Path $packageDir 'install.ps1') -Force
+          Compress-Archive -Path $packageDir -DestinationPath (Join-Path $artifactDir "btop-agent_${version}_windows_${{ matrix.arch_name }}.zip") -Force
+
+      - uses: actions/upload-artifact@v6
+        with:
+          name: agent-windows-${{ matrix.arch_name }}
+          path: ${{ runner.temp }}/release-assets/*
+          if-no-files-found: error
+
   release:
     needs:
       - prepare
       - docker-tarball
-      - agent-build
+      - agent-build-unix
+      - agent-build-windows
     if: needs.prepare.outputs.should_release == 'true'
     runs-on: ubuntu-latest
     steps:
@@ -225,6 +330,7 @@ jobs:
           mkdir -p release-assets
           find downloaded-artifacts -type f -exec cp {} release-assets/ \;
           cp install.sh release-assets/install.sh
+          cp install.ps1 release-assets/install.ps1
           (
             cd release-assets
             find . -maxdepth 1 -type f ! -name 'SHA256SUMS.txt' -print0 \

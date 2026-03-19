@@ -1,3 +1,6 @@
 [submodule "btop"]
 	path = btop
 	url = https://github.com/aristocratos/btop.git
+[submodule "btop4win"]
+	path = btop4win
+	url = https://github.com/aristocratos/btop4win.git
